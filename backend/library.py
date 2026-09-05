@@ -27,12 +27,14 @@ import shutil
 import threading
 import tempfile
 from typing import Optional
+import logging
 
 try:
     import soundfile as sf
 except ImportError:  # pragma: no cover
     sf = None
 
+logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 
@@ -48,11 +50,23 @@ def _load_index(library_dir: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except json.JSONDecodeError as e:
         # Índice corrupto (ej. proceso murió a mitad de escritura antes del
-        # os.replace atómico de abajo, o edición manual rota) -> arrancar de
-        # cero antes que tirar 500 en cada request. Los archivos en disco no
-        # se tocan, solo se pierde su entrada del índice.
+        # os.replace atómico de abajo, o edición manual rota) -> mover a backup
+        # para forense y arrancar de cero antes que tirar 500 en cada request.
+        try:
+            ts = int(time.time())
+            corrupt = f"{path}.corrupt_{ts}"
+            os.replace(path, corrupt)
+            logger.error("Índice de librería corrupto; movido a %s", corrupt)
+        except Exception:
+            logger.exception("No se pudo mover índice de librería corrupto")
+        return {}
+    except OSError:
+        logger.exception("Error leyendo índice de librería %s", path)
+        return {}
+    except Exception:
+        logger.exception("Error inesperado leyendo índice de librería %s", path)
         return {}
 
 
@@ -75,9 +89,8 @@ def _save_index(library_dir: str, index: dict) -> None:
             except Exception:
                 pass
             raise
-    except Exception as e:
-        import logging
-        logging.warning(f"Error escribiendo índice de librería: {e}")
+    except Exception:
+        logger.exception("Error escribiendo índice de librería: %s", path)
 
 
 def _probe_audio(path: str) -> dict:
@@ -88,12 +101,12 @@ def _probe_audio(path: str) -> dict:
         try:
             info = sf.info(path)
             return {
-                "duration_sec": round(float(info.frames) / float(info.samplerate), 2),
-                "sample_rate": int(info.samplerate),
-                "channels": int(info.channels),
+                "duration_sec": round(float(info.frames) / float(info.samplerate), 2) if info.samplerate else None,
+                "sample_rate": int(info.samplerate) if info.samplerate else None,
+                "channels": int(info.channels) if info.channels is not None else None,
             }
         except Exception:
-            pass
+            logger.exception("Error sondando header de audio %s", path)
     return {"duration_sec": None, "sample_rate": None, "channels": None}
 
 
@@ -157,5 +170,5 @@ def delete_file(library_dir: str, file_id: str) -> bool:
         if os.path.exists(stored_path):
             os.remove(stored_path)
     except Exception:
-        pass
+        logger.exception("Error borrando archivo de librería %s", stored_path)
     return True
