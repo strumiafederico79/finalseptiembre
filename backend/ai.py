@@ -82,7 +82,8 @@ def create_ai_router(*, upload_dir: str, read_and_validate, resolve_input_source
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
-            logger.error(f"Error en /ai/chat: {exc}", exc_info=True)
+            # Registrar la excepción con traceback para diagnóstico, devolver mensaje genérico
+            logger.exception("Error en /ai/chat")
             raise HTTPException(500, "Error interno del asistente de IA.") from exc
 
     @router.post("/ai/suggest", tags=["Asistente IA"])
@@ -108,7 +109,7 @@ def create_ai_router(*, upload_dir: str, read_and_validate, resolve_input_source
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
-            logger.error(f"Error en /ai/suggest: {exc}", exc_info=True)
+            logger.exception("Error en /ai/suggest")
             raise HTTPException(500, "No se pudo analizar el track para sugerir parámetros.") from exc
         finally:
             if os.path.exists(tmp_path):
@@ -147,7 +148,7 @@ def create_ai_router(*, upload_dir: str, read_and_validate, resolve_input_source
         except Exception as exc:
             if os.path.exists(input_path):
                 os.remove(input_path)
-            logger.error(f"Error en /ai/auto-master (análisis/decisión): {exc}", exc_info=True)
+            logger.exception("Error en /ai/auto-master (análisis/decisión)")
             raise HTTPException(500, "No se pudo analizar el track para el mastering automático.") from exc
 
         decision = _fix_ai_decision_params(decision)
