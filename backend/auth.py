@@ -16,14 +16,14 @@ Admin: se crea automáticamente al arrancar si no existe. Credenciales en .env:
   JWT_SECRET=string_aleatorio_largo
 """
 
-import os, json, uuid, hashlib, hmac, time, base64, threading, secrets, string
+import os, json, uuid, hashlib, hmac, time, base64, threading, secrets, string, tempfile
 from typing import Optional
 from fastapi import HTTPException, Depends, Header
 import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────[...]
 
 USERS_DB_PATH  = os.getenv("USERS_DB_PATH", "users_db.json")
 
@@ -60,8 +60,8 @@ def _get_or_generate_admin_password() -> str:
         secrets.choice(string.ascii_letters + string.digits + "!@#$%^&*") for _ in range(16)
     )
     logger.warning(
-        f"⚠️  ADMIN_PASSWORD no configurado. Contraseña generada: {generated}\n"
-        "     ⚠️  CÁMBIALA en la primera sesión. En producción, define ADMIN_PASSWORD en .env."
+        "⚠️  ADMIN_PASSWORD no configurado. Se generó una contraseña temporal para esta instancia; "
+        "configura ADMIN_PASSWORD en producción."
     )
     return generated
 
@@ -71,10 +71,12 @@ _db_lock = threading.RLock()
 
 # ── Helpers de hash y JWT ─────────────────────────────────────────────────────
 
+
 def _hash_password(password: str) -> str:
     salt = os.urandom(16)
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
     return base64.b64encode(salt + key).decode()
+
 
 def _verify_password(password: str, hashed: str) -> bool:
     try:
@@ -85,8 +87,10 @@ def _verify_password(password: str, hashed: str) -> bool:
     except Exception:
         return False
 
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
 
 def _create_jwt(user_id: str, email: str, role: str) -> str:
     header  = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
@@ -102,6 +106,7 @@ def _create_jwt(user_id: str, email: str, role: str) -> str:
     ).digest())
     return f"{header}.{payload}.{sig}"
 
+
 def _verify_jwt(token: str) -> dict:
     try:
         parts = token.split(".")
@@ -113,15 +118,18 @@ def _verify_jwt(token: str) -> dict:
         ).digest())
         if not hmac.compare_digest(sig, expected_sig):
             raise ValueError("firma inválida")
-        padding = 4 - len(payload) % 4
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * padding))
+        # Correct padding computation for base64url
+        missing = (-len(payload)) % 4
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * missing))
         if data.get("exp", 0) < time.time():
             raise ValueError("token expirado")
         return data
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Token inválido: {e}")
+        logger.exception("_verify_jwt error: %s", e)
+        raise HTTPException(status_code=401, detail="Token inválido")
 
 # ── DB de usuarios (JSON en disco) ────────────────────────────────────────────
+
 
 def _load_db() -> dict:
     with _db_lock:
@@ -130,13 +138,45 @@ def _load_db() -> dict:
         try:
             with open(USERS_DB_PATH, "r") as f:
                 return json.load(f)
-        except Exception:
+        except json.JSONDecodeError:
+            # Corrupt DB file: back it up for forensics and start a fresh DB to avoid 500s
+            try:
+                ts = int(time.time())
+                corrupt_path = f"{USERS_DB_PATH}.corrupt_{ts}"
+                os.replace(USERS_DB_PATH, corrupt_path)
+                logger.error("users DB corrupto, movido a %s", corrupt_path)
+            except Exception:
+                logger.exception("No se pudo renombrar users DB corrupto")
             return {"users": {}}
+        except Exception:
+            logger.exception("Error leyendo users DB")
+            return {"users": {}}
+
 
 def _save_db(db: dict) -> None:
     with _db_lock:
-        with open(USERS_DB_PATH, "w") as f:
-            json.dump(db, f, indent=2)
+        dirpath = os.path.dirname(os.path.abspath(USERS_DB_PATH)) or "."
+        try:
+            fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=".users_db_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(db, f, indent=2)
+                # Atomically replace
+                os.replace(tmp, USERS_DB_PATH)
+                try:
+                    os.chmod(USERS_DB_PATH, 0o600)
+                except Exception:
+                    # Non-fatal if filesystem doesn't allow chmod (e.g., Windows)
+                    logger.debug("No se pudo aplicar chmod 600 a %s", USERS_DB_PATH)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            logger.exception("Error escribiendo users DB")
+
 
 def _get_user_by_email(email: str) -> Optional[dict]:
     db = _load_db()
@@ -145,11 +185,13 @@ def _get_user_by_email(email: str) -> Optional[dict]:
             return u
     return None
 
+
 def _get_user_by_id(user_id: str) -> Optional[dict]:
     db = _load_db()
     return db["users"].get(user_id)
 
 # ── Bootstrap: crear admin si no existe ──────────────────────────────────────
+
 
 def bootstrap_admin() -> None:
     existing = _get_user_by_email(ADMIN_EMAIL)
@@ -171,6 +213,7 @@ def bootstrap_admin() -> None:
 
 # ── FastAPI dependency: usuario actual ────────────────────────────────────────
 
+
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Se requiere autenticación")
@@ -183,12 +226,14 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
         raise HTTPException(status_code=403, detail="Tu cuenta está pendiente de aprobación")
     return user
 
+
 def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict:
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Se requiere rol de administrador")
     return current_user
 
 # ── Handlers de endpoints (se registran en app.py) ───────────────────────────
+
 
 def handle_register(email: str, password: str, name: str) -> dict:
     email = email.strip().lower()
@@ -217,6 +262,7 @@ def handle_register(email: str, password: str, name: str) -> dict:
         "user_id": user_id,
         "status": "pending",
     }
+
 
 def handle_login(email: str, password: str) -> dict:
     user = _get_user_by_email(email.strip().lower())
@@ -261,6 +307,7 @@ def handle_ws_ticket(current_user: dict = Depends(get_current_user)) -> dict:
     sig = _b64url(hmac.new(JWT_SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest())
     return {"token": f"{header}.{body}.{sig}", "expires_in": WS_TICKET_EXPIRY_SEC}
 
+
 def handle_me(current_user: dict = Depends(get_current_user)) -> dict:
     return {
         "id": current_user["id"],
@@ -269,6 +316,7 @@ def handle_me(current_user: dict = Depends(get_current_user)) -> dict:
         "role": current_user["role"],
         "status": current_user["status"],
     }
+
 
 def handle_list_users(admin: dict = Depends(get_admin_user)) -> list:
     db = _load_db()
@@ -286,6 +334,7 @@ def handle_list_users(admin: dict = Depends(get_admin_user)) -> list:
         if u["id"] != admin["id"]
     ]
 
+
 def handle_approve_user(user_id: str, admin: dict = Depends(get_admin_user)) -> dict:
     db = _load_db()
     user = db["users"].get(user_id)
@@ -295,6 +344,7 @@ def handle_approve_user(user_id: str, admin: dict = Depends(get_admin_user)) -> 
     user["approved_at"] = time.time()
     _save_db(db)
     return {"message": f"Usuario {user['email']} aprobado", "user_id": user_id}
+
 
 def handle_reject_user(user_id: str, admin: dict = Depends(get_admin_user)) -> dict:
     db = _load_db()
@@ -307,6 +357,7 @@ def handle_reject_user(user_id: str, admin: dict = Depends(get_admin_user)) -> d
     _save_db(db)
     return {"message": f"Usuario {user['email']} rechazado", "user_id": user_id}
 
+
 def handle_delete_user(user_id: str, admin: dict = Depends(get_admin_user)) -> dict:
     db = _load_db()
     user = db["users"].get(user_id)
@@ -317,6 +368,7 @@ def handle_delete_user(user_id: str, admin: dict = Depends(get_admin_user)) -> d
     del db["users"][user_id]
     _save_db(db)
     return {"message": f"Usuario eliminado", "user_id": user_id}
+
 
 def handle_change_password(
     current_password: str,
